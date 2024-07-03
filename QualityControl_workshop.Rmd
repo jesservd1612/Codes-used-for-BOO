@@ -1,0 +1,455 @@
+---
+title: "BOO2024 - Hands-on workshop DEG analysis"
+author: ""
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: default
+    highlight: kate
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+# Setup {.tabset}
+```{r include=FALSE, echo=TRUE, message=FALSE}
+rm(list = ls()); gc()
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+```
+
+
+## Load packages
+### CRAN
+```{r}
+# Check if pacman is available and install
+if(!require("pacman", quietly = T)){install.packages("pacman")}; library(pacman)
+
+# use packman to install CRAN packages
+p_load(tidyverse, ggpubr, corrr, ggfortify, ggcorrplot, ggdendro, data.table, GGally)
+```
+
+
+## Set directories
+```{r}
+# input directory
+if(!dir.exists("INPUT")){
+  dir.create(path = file.path(getwd(), "DATA"))
+}
+input_dir <- file.path(getwd(), "DATA")
+
+# output directory
+if(!dir.exists("OUTPUT")){
+  dir.create(path = file.path(getwd(), "INPUT"))
+}
+output_dir <- file.path(getwd(), "INPUT")
+
+# plot directory
+if(!dir.exists("PLOT")){
+  dir.create(path = file.path(getwd(), "PLOT"))
+}
+plot_dir <- file.path(getwd(), "PLOT")
+```
+
+
+## Load functions
+```{r}
+# Function: Get low cpm probes ----
+get_low_cpm_probes <- function(countdata, metadata, exclude){
+
+  if(!has_rownames(countdata)){
+    countdata <- countdata %>%
+      column_to_rownames(var = names(countdata %>% dplyr::select(where(is.character))))
+  }
+
+  if(!all(c("SAMPLE_ID", "MEAN_ID") %in% colnames(metadata))){
+    stop("Metadata must contain columns SAMPLE_ID and MEAN_ID")
+  }
+
+  countdata <- countdata %>% select(-contains(paste(c(exclude, collapse = "|"))))
+
+  countdata <- data.frame(ifelse(test = countdata >= 1, yes = 1, no = 0)) %>%
+    mutate(across(where(is.numeric), ~as.logical(.x)))
+
+  countdata <- countdata %>%
+    rownames_to_column(var = "GENE_SYMBOL") %>%
+    pivot_longer(cols = where(is.logical), names_to = "SAMPLE_ID") %>%
+    left_join(x = metadata %>%
+                dplyr::select(SAMPLE_ID, MEAN_ID) %>%
+                group_by(MEAN_ID) %>%
+                mutate(n = n()) %>%
+                ungroup(),
+              by = "SAMPLE_ID") %>%
+    group_by(MEAN_ID, n, GENE_SYMBOL) %>%
+    summarise(value = sum(value), .groups = "drop") %>%
+    filter(value <= n * 0.75)
+
+  n_mean_id <- length(unique(countdata$MEAN_ID))
+
+  countdata %>%
+    group_by(GENE_SYMBOL) %>%
+    count() %>%
+    filter(n == n_mean_id) %>%
+    pull(GENE_SYMBOL) %>%
+    unique()
+}
+
+```
+
+
+# Load data {.tabset}
+
+## Metadata
+Here you should load the metadata you obtained.
+* What is metadata?
+- Metadata is the data that describes the characteristics of the count data.
+```{r}
+metadata <- fread(input = file.path(input_dir, "EUT046_RPTECTERT1_cisplatin_metadata.csv"))
+```
+
+## Countdata
+Here you should load the raw data you obtained.
+* What is (raw) count data?
+- Count data is the data that contains the data that you received from the experiments.
+```{r}
+countdata_raw <- fread(input = file.path(input_dir, "EUT046_RPTECTERT1_cisplatin_rawcounts.csv"))
+```
+
+## Wrangle countdata and metadata
+Inspect the metadata object by clicking on it in the environment panel in the top right and answer the following questions.
+*	How many samples are in the data? (hint: metadata$SAMPLE_ID)
+- 204 samples
+*	What cell type was used for compound exposure?*
+- RPTEC/TERT1 cells
+*	Which time points are included?
+- 0h, 4h, 8h, 16h, 24h, 48h, 72h
+*	Which concentrations were used for the exposure?
+- 0.1 uM, 0.5 uM, 1 uM, 2.5 uM, 5 uM, 10 uM, 20 uM, 30 uM, 50 uM 
+*	Which compounds do we consider "treatment" and "control"?
+- 'control' = DMEM en 'treatment' = CISPLATIN
+*	Treatment conditions are a combination of treatment, dose and time. What treatment conditions are in the data? (hint: unique(expand(metadata, nesting(COMPOUND, CONCENTRATION, TIMEPOINT))) 
+- (Under the code)
+
+Now in inspect the raw countdata object by clicking it in the enviroment panel in the top right and answer the following question.
+*	How many probes are in the data? (hint: countdata_raw$GENE_SYMBOL)
+- 21111 probes
+*	Look at the dimensions of the dataframe (rows and columns). How many probes (rows) were measured?
+- 4.306.644 probes.
+```{r error=F,warning=F,message=F}
+# We wrangle the original metadata to generate new treatment conditions and format the metadata into a clear overview. Have a look!
+metadata <- metadata %>% 
+  unite(col = "MEAN_ID", c(CELL_ID, COMPOUND_ABBR, TIMEPOINT, DOSE), remove = F) %>% 
+  select(SAMPLE_ID, MEAN_ID, TIME, TIMEPOINT, REPLICATE, COMPOUND, COMPOUND_ABBR, CELL_ID, SPECIES, DOSE, DOSE_LEVEL) %>%
+  rename("CONCENTRATION" = DOSE)
+
+print(unique(metadata$MEAN_ID))
+
+# We rename the countdata column with the probes and reorder all other columns to match the metadata sample id order.  
+countdata_raw <- countdata_raw %>% 
+  rename(GENE_SYMBOL = PROBE_ID) %>%
+  select(GENE_SYMBOL, metadata$SAMPLE_ID) # Reorder columns
+
+# We print the output
+ { print("Raw countdata")
+  cat("\n")
+  countdata_raw %>% str()
+  cat("\n")
+  print("Metadata")
+  cat("\n")
+  metadata %>% str()}
+
+```
+
+
+## QC1: Total read count filter
+The total read counts filter, also called sample size filter, is applied to discart samples with a low library size. Answer the following questions.
+*	What is the definition of library size?
+- the total number of reads that were sequenced in the run.
+*	What is the definition of low library size samples?
+- Samples that have a value under the threshold (1 million)
+*	How many samples are excluded from further analysis – if there are any? (Hint: look at the plot) 
+- 6 samples.
+*	Why do we need to eliminate the low library size samples before normalizing the data?
+- They are eliminated because otherwise the variance would be too high.
+```{r error=F,warning=F,message=F}
+# We set the threshold to 1 million
+countdata_threshold <- 1E6
+
+
+# We take the sum of every individual column and transpose the data frame
+size <- countdata_raw %>%
+  summarise(across(where(is.numeric), sum)) %>%
+  pivot_longer(cols = everything(), names_to = "SAMPLE_ID", values_to = "SAMPLE_SIZE")
+
+
+# We make a bar plot using ggplot of the sample sizes with the threshold as red horizontal line for quick interpretation
+ggplot(data = size, mapping = aes(x = SAMPLE_ID, y = SAMPLE_SIZE)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, size = 2)) +
+  geom_hline(yintercept=countdata_threshold, size = 2, color = "red")+
+  ggtitle("Sample size of raw countdata") + 
+  ylab('Sample size')
+
+
+# We identify the samples with a size (total amount of counts) below or equal to the threshold.
+bad_samples = size %>% filter(SAMPLE_SIZE <= countdata_threshold)
+
+# We filter the raw countdata for the bad samples, "fsample" in countdata_raw_fsample means filtered sample
+countdata_raw_fsample = countdata_raw %>% select(-all_of(bad_samples %>% pull(SAMPLE_ID)))
+
+# We filter the metadata for the bad samples, "fsample" in metadata_fsample means filtered sample
+metadata_fsample = metadata %>% filter(!SAMPLE_ID %in% bad_samples$SAMPLE_ID)
+
+# We print the output
+  bad_samples %>% str()
+  bad_samples
+```
+
+
+## QC2: Relevance filter at the CPM level
+
+#### QC2.1: Relevance filter to be applied to normalized data: count per million normalization formula
+```{r}
+# CPM (Counts Per Million) are obtained by dividing counts by the library counts sum and multiplying the results by a million. 
+cpm_normalization <- function(x){
+(x/sum(x))*1000000
+}
+
+countdata_cpm <- data.frame(apply(countdata_raw %>% column_to_rownames(var = "GENE_SYMBOL"), 2, cpm_normalization))
+```
+
+
+#### QC2.2: Relevance filter
+The relevance filter is applied to discart all probes that do not reach at least 1 CPM in all 3 replicates across all treatment conditions. Answer the following questions.
+* What is the definition of probes?
+- stretches of single-stranded RNA of about 50 bases used to detect the presence of complementary nucleic acid sequences by hybridization.
+* How do we identify if a probe has low counts?
+- If it has no reads for all samples.
+* How many low count probes (probes that are exempted from analysis) are in the data?
+- 8477 low count probes
+* Why do we need to eliminate the low expressed probes?
+- Because they are not relevant and reliable.
+```{r error=F,warning=F,message=F}
+
+low_cpm_probes <- get_low_cpm_probes(countdata = countdata_cpm, metadata = metadata, exclude = c())
+countdata_raw_fsample_fprobe = countdata_raw_fsample %>% filter(!GENE_SYMBOL %in% low_cpm_probes)
+
+  low_cpm_probes %>% str() 
+```
+
+## QC3: Sum the raw counts of probes targeting the same gene 
+* Why are there multiple probes for a single gene?
+- Sometimes the gene is larger than the probe so multiple probes can bind to the same gene
+* Why do we take the sum of the probes targeting the same gene and not the mean?
+- Because the total expression of a gene is more important than the average expression.
+In the 'probe_distribution' we included only the gene name with the highest probe count out of all genes. 
+* Why does this gene have many probes? (Hint: use external resources such as NCBI gene, GeneCards or UniProt)
+- It says 'NA' so I don't know which gene it is.
+*  What are the differences in data frame dimension (rows and columns) before and after summing the probes?
+- There are 943 less observations.
+```{r error=F,warning=F,message=F}
+# After filtering for low cpm probes how many probes are left that target multiple genes
+probe_distribution <- countdata_raw_fsample_fprobe %>% 
+  separate(col = GENE_SYMBOL, into = c("GENE_SYMBOL", "PROBE"), sep = "_") %>% 
+  select(GENE_SYMBOL, PROBE) %>% 
+  group_by(GENE_SYMBOL) %>% 
+  summarise(x = n()) %>% 
+  count(x) %>% select("Probe count" = x,
+                      "Unique genes" = n)
+
+# We attach the gene symbol for the highest probe count only 
+probe_distribution <- countdata_raw_fsample_fprobe %>% 
+  separate(col = GENE_SYMBOL, into = c("GENE_SYMBOL", "PROBE"), sep = "_") %>% 
+  select(GENE_SYMBOL, PROBE) %>% 
+  group_by(GENE_SYMBOL) %>% 
+  count() %>% 
+  arrange(desc(n)) %>% 
+  filter(n == 9) %>% # Change '9'to the highest 'Probe count' in the probe_distribution dataframe
+  right_join(y = probe_distribution, by = c("n" = "Probe count")) %>% 
+  arrange(n) %>% 
+  select("Probe Count" = n, `Unique genes`, GENE_SYMBOL)
+
+# We sum the probes targeting the same gene
+countdata_raw_fsample_fprobe_sumprobe <- countdata_raw_fsample_fprobe %>% 
+  separate(col = GENE_SYMBOL, into = c("GENE_SYMBOL", "PROBE"), sep = "_") %>% 
+  group_by(GENE_SYMBOL) %>% 
+  summarise(across(where(is.numeric), sum), .groups = "drop")
+
+# We print the output
+{  print(probe_distribution)
+  cat("\n")
+  print("Dataframe dimensions before probe sum")
+  dim(countdata_raw_fsample_fprobe) %>% str()
+  cat("\n")
+  print("Dimensions after probe sum")
+  dim(countdata_raw_fsample_fprobe_sumprobe) %>% str()
+}
+```
+
+
+## Countdata CPM normalization
+* Why do we need to normalize the counts for further downstream analysis?
+- Normalizing the counts improves the statistical power of further downstream analysis and also makes the samples comparable with each other.
+* What is the formula for CPM normalization?
+- CPM = counts for a gene / total counts in sample x 10^6
+* What is the main difference between the dataframes before and after CPM normalization, and can you explain the difference?
+- The dataframes after CPM normalization are easier to compare because it scales the data to a common scale accross samples.
+```{r error=F,warning=F,message=F}
+# We use the apply function to apply our cpm_normalization column wise (indicated by the 2) over the countdata_raw_fsample_fprobe_sumprobe object
+countdata_cpm_fsample_fprobe_sumprobe <- data.frame(apply(countdata_raw_fsample_fprobe_sumprobe %>% 
+                                                            column_to_rownames(var = "GENE_SYMBOL"), 2, cpm_normalization))
+
+# We print the output
+{  print("Countdata raw")
+  cat("\n")
+  data.frame(countdata_raw_fsample_fprobe_sumprobe %>% column_to_rownames(var = "GENE_SYMBOL") %>% str())
+  cat("\n")
+  print("Countdata cpm normalized")
+  cat("\n")
+  countdata_cpm_fsample_fprobe_sumprobe %>% str()
+} 
+```
+
+# Counts distribution 
+We can make distribution plots to visualize the difference between the raw countdata and normalized countdata. Look at the two counts distributions and answer the following questions.
+* What is the difference between the distribution of the raw counts and the CPM normalized counts?
+- The CPM normalized counts are distributed much better than the raw counts. They are closer together and align much better as well
+*	Based on the distribution plots and identifying the main differences between the dataframes before and after CPM normalization, why do we need to normalize the counts for further analysis?
+- It improves the statistical power of the dataframes and makes it easier to compare the samples with each other. It also corrects for technical biases.
+```{r}
+# Reshape raw countdata to long format. Have a look to see the change!
+countdata_raw_long <- countdata_raw_fsample_fprobe_sumprobe %>%
+  pivot_longer(cols = -GENE_SYMBOL, names_to = "SAMPLE_ID", values_to = "COUNTS")
+
+# Reshape CPM normalized countdata to long format. Have a look to see the change!
+countdata_cpm_long <- countdata_cpm_fsample_fprobe_sumprobe %>%
+  rownames_to_column(var = "GENE_SYMBOL") %>%
+  pivot_longer(cols = -GENE_SYMBOL, names_to = "SAMPLE_ID", values_to = "COUNTS")
+
+
+# count distribution from the raw count data
+ggplot(countdata_raw_long, aes(x = reorder(SAMPLE_ID, COUNTS, FUN = median), y = COUNTS+1)) +
+        geom_boxplot(size = 0.3, outlier.size = 0.5) +
+        scale_y_log10(limits = c(1, max(countdata_raw_long$COUNTS))) +
+        theme_classic() +
+        theme(plot.title = element_text(size=14, face="bold", vjust = 2, hjust = 0.5), 
+              axis.title.x = element_text(size=12, vjust = 0.25),
+              axis.title.y = element_text(size=12, vjust = 1),
+              axis.text.x = element_text(size=8, angle=90, vjust=0.5, hjust=1),
+              axis.text.y = element_text(size=12)) +
+        ggtitle("Distribution raw counts") + ylab('counts') + xlab("sampleID")
+
+# count distribution from the CPM normalized count data
+ggplot(countdata_cpm_long, aes(x = reorder(SAMPLE_ID, COUNTS, FUN = median), y = COUNTS)) +
+        geom_boxplot(size = 0.3, outlier.size = 0.5) +
+  scale_y_log10(limits = c(1, max(countdata_cpm_long$COUNTS))) +
+        theme_classic() +
+        theme(plot.title = element_text(size=14, face="bold", vjust = 2, hjust = 0.5), 
+              axis.title.x = element_text(size=12, vjust = 0.25),
+              axis.title.y = element_text(size=12, vjust = 1),
+              axis.text.x = element_text(size=8, angle=90, vjust=0.5, hjust=1),
+              axis.text.y = element_text(size=12)) +
+        ggtitle("Distribution CPM Normalized counts") + ylab('CPM Normalized counts') + xlab("sampleID")
+
+```
+
+
+## PCA plot and correlation plot 
+
+### Principal component analysis on CPM normalized counts
+We make a PCA plot to help detect outliers that behave differently from the majority of samples. 
+* Why do we use the CPM normalized countdata and not the raw countdata?
+- Because the CPM normalized countdata is much easier to compare.
+* What conclusions can you draw from inspection of the PCA plot?
+- There are quite a few outliers, which means that the variance is a bit high.
+```{r error=F,warning=F,message=F}
+# We transpose the prepared count data: sampleIDs from the column names to a single row, and all GENE_SYMBOL count data to an individual column
+pca_data <- countdata_cpm_fsample_fprobe_sumprobe %>% 
+  rownames_to_column(var = "GENE_SYMBOL") %>% 
+  pivot_longer(-GENE_SYMBOL) %>% 
+  pivot_wider(names_from = GENE_SYMBOL, values_from = value) %>% 
+  rename(SAMPLE_ID = name) %>% # change 'name' to 'SAMPLE_ID' for clarity
+  left_join(metadata_fsample %>% select(SAMPLE_ID, CONCENTRATION, TIME), by = "SAMPLE_ID") %>%
+  mutate(TIME = as.character(TIME))
+
+
+# We perform pca analysis on the numerical columns (the count data)
+pca_object = prcomp(pca_data %>% select(where(is.numeric)), center = F, scale. = F)
+
+# We print the output
+{  print("First 10 column of the count data")
+  print(pca_data %>% head() %>% select(1:10))
+  cat("\n")
+  autoplot(object = pca_object, data = pca_data, colour = "CONCENTRATION", shape = "TIME",  size = 2) + 
+    theme_bw()
+}
+```
+
+After rescaling the x and y axis of the PCA plot what conclusion can you make and does it overlap with your previous conclusion?
+- The plot looks much better. The points are much closer now so there are not any outliers. The variance is much lower.
+```{r error=F,warning=F,message=F}
+# We rescale the x and y coordinates to -1 to 1 and print the new plot
+autoplot(object = pca_object, data = pca_data, colour = "CONCENTRATION", shape = "TIME",  size = 2) + 
+  theme_bw() + coord_cartesian(xlim = c(-1,1), ylim = c(-1,1))
+
+```
+
+
+### Replicate correlation 
+* What is the definition of a replicate?
+- A replicate is a duplicate of an experiment that is performed to see if the results are similar to each other and statistically relevant.
+* Why do we analyze the correlation between replicates?
+- Because it is important to know if a result is similar or not so we can conclude if it is relevant or a coincidence.
+* Do the replicates (for the same treatment condition) correlate with each other?
+- Yes, the R-squared values of all replicates are high which indicates a correlation.
+```{r error=F,warning=F,message=F}
+# We combine the replicates from the same treatment condition and perform replicate correlation using the ggpairs function
+correlation = countdata_cpm_fsample_fprobe_sumprobe %>%
+  rownames_to_column(var = "GENE_SYMBOL") %>%
+  pivot_longer(-GENE_SYMBOL,names_to = "SAMPLE_ID") %>%
+  left_join(metadata_fsample, by = "SAMPLE_ID") %>%
+  select(GENE_SYMBOL, SAMPLE_ID, MEAN_ID, value) %>% 
+  nest_by(MEAN_ID) %>% 
+  mutate(data = list(data %>% pivot_wider(names_from = SAMPLE_ID, values_from = value)),
+         plot = list(ggpairs(data = data %>% select(-GENE_SYMBOL),upper = list(continuous = "cor")) + theme_bw())) 
+
+# We print the output
+  for(i in 1:4){
+    print(correlation$MEAN_ID[[i]])
+    print(correlation$plot[[i]])
+  }
+  
+```
+
+
+#### General CPM correlation plot
+ * What can you conclude from this correlation plot? Do the results overlap with your conclusions from the PCA plot? 
+ - There is a lot of red which indicates that most of the samples correlate well with each other. The results overlap with the PCA plot, which shows correlation as well.
+ *  What conclusion can you make using this plot that you could not make using the replicate correlation plot?
+ - This plot also shows correlation between all the different samples and not just replicates.
+```{r error=F,warning=F,message=F}
+# We correlate all the count data and generate a correlation plot
+plot = ggcorrplot(corr = correlate(countdata_cpm_fsample_fprobe_sumprobe, diagonal = 1, quiet = T) %>% 
+                    column_to_rownames(var = "term"), lab = FALSE, hc.order = T) +
+  scale_fill_gradient2(limit = c(0.8,1), low = "white", high =  "red", mid = "lightblue", midpoint = 0.9) +
+   theme(axis.text.x = element_text(size = 6), axis.text.y = element_text(size = 6))
+
+
+# We print the output
+  plot
+```
+
+
+# Save output
+We save our preprocessed raw count data (`countdata_raw_fsample_fprobe_sumprobe`) and metadata (`metadata_fsample`) in preperation for the DEG analysis. Since the DESeq2 package used for the DEG analysis performs its own normalization, we specifically save the raw count data rather than the normalized count data.
+```{r}
+# Save your countdata
+write_csv(countdata_raw_fsample_fprobe_sumprobe, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_countdata_raw_processed.csv"))) 
+
+# Save your metadata
+write_csv(metadata_fsample, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_metadata_processed.csv"))) 
+
+# Save normalized countdata
+write_csv(countdata_cpm_fsample_fprobe_sumprobe, file.path(output_dir, paste0(gsub( "-", "", Sys.Date()), "_countdata_cpm_fsample_fprobe_sumprobe.csv"))) 
+```

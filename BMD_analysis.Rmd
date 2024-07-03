@@ -1,0 +1,428 @@
+---
+title: "BOO 2024 - BMD analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+# Setup {.tabset}
+```{r include=FALSE, echo=TRUE, message=FALSE}
+rm(list = ls()); gc()
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+```
+
+
+## Load packages
+### CRAN
+```{r}
+# Check if pacman is available and install
+if(!require("pacman", quietly = T)){install.packages("pacman")}; library(pacman)
+
+# use packman to install CRAN packages
+p_load(tidyverse, ggpubr, corrr, ggfortify, ggcorrplot, ggdendro, data.table, GGally)
+```
+
+
+
+## Set directories
+```{r}
+# input directory
+if(!dir.exists("INPUT")){
+  dir.create(path = file.path(getwd(), "INPUT"))
+}
+input_dir <- file.path(getwd(), "INPUT")
+
+# input directory
+if(!dir.exists("OUTPUT")){
+  dir.create(path = file.path(getwd(), "OUTPUT"))
+}
+output_dir <- file.path(getwd(), "OUTPUT")
+
+# plot directory
+if(!dir.exists("PLOT")){
+  dir.create(path = file.path(getwd(), "PLOT"))
+}
+plot_dir <- file.path(getwd(), "PLOT")
+```
+
+
+
+# Load data {.tabset}
+
+## Metadata
+Here you should load the metadata you obtained.
+* What is metadata and how many samples do you have?
+- Metadata is the data that describes the countdata. There are 198 samples.
+```{r}
+metadata_fsample <- fread(input = file.path(input_dir, "20240516_metadata_processed.csv"))
+```
+
+## Countdata
+Here you should load the raw data you obtained.
+* What type of normalization was applied?
+- CPM normalization.
+```{r}
+countdata_cpm <- fread(input = file.path(input_dir, "20240521_countdata_cpm_fsample_fprobe_sumprobe.csv"))
+```
+
+
+## Wrangle countdata for BMD analysis
+```{r}
+metadata_fsample <- metadata_fsample |>
+  mutate(COMPOUND_TIME = paste0(COMPOUND,"_",TIME))
+
+genes = countdata_cpm |> pull(GENE_SYMBOL)
+
+compound = "CISPLATIN"
+
+compound_time <- metadata_fsample |> 
+  filter(COMPOUND == compound) |>
+  pull(COMPOUND_TIME) |> 
+  unique()
+  
+
+for(i in compound_time) {
+  metadata_subset <- metadata_fsample |>
+    filter(COMPOUND_TIME == i)
+  
+  countdata_subset = countdata_cpm |>
+    select(GENE_SYMBOL,metadata_subset$SAMPLE_ID) |>
+    column_to_rownames("GENE_SYMBOL") |>
+    t() |>
+    as.data.frame() |>
+    rownames_to_column("SAMPLE_ID") |>
+    left_join(metadata_subset |> dplyr::select(SAMPLE_ID,COMPOUND,CONCENTRATION,DOSE_LEVEL,REPLICATE)) |>
+    arrange(DOSE_LEVEL,REPLICATE) |>
+    dplyr::select(SAMPLE_ID, CONCENTRATION, all_of(genes)) |>
+    column_to_rownames("SAMPLE_ID") |>
+    t() |>
+    as.data.frame() |>
+    rownames_to_column("GENE_SYMBOL")
+  
+  fwrite(countdata_subset, paste0(input_dir, "/BMD_input_",i,"countdata_normalized_gene.txt"), row.names = F, sep = "\t")
+}
+```
+
+#3 Load data in BMDExpress 2.3
+
+Here you will load and analyse the data in BMDExpress 2.3 using the import function of a Generic geneset with a BASE2 transformation. 
+
+First perform a William's Trend test, with p<0.05 threshold, but without any fold change threshold.
+* How many genes do show a dose / concentration response for each of the timeponts?
+- 4h: 199 genes, 8h: 3317 genes, 16h: 4067 genes, 24h: 8387 genes, 48h: 7115 genes, 72h: 7756 genes.
+Then perform a BMD analysis with the standard settings. 
+You can save the output in a text file. 
+* Which five genes have the lowest BMD for each timepoint.
+4h: INSIG1, KCNJ15, DNAJB9, SNAI2, WBP4.
+8h: YWHAH, SEPT6, USP53, ZBTB5, RTEL1-TNFRSF6B.
+16h: ACYP1, C1orf228, CFI, GOSR2, BDH1.
+24h: STX12, USP5, SNAPC2, RNF5, INPP5K.
+48h: ENO2, SERPINE2, ADD3, ACSL3, CAV2.
+72h: FADS1, COG6, HACL1, PDE4D, AFP.
+
+Finally perform a pathway analysis, first with REACTOME/GOterms and secondly with a predefined geneset from the RPTEC/TERT1 modules.
+* Which pathways show the most significant concentration responses?
+* Which modules show the most significant concentration responses?
+* Are these two results pointing at similar pathways?
+
+```{r}
+install.packages("ggplot2")
+library(ggplot2)
+library(dplyr)
+```
+## Read and combine the data of functional classification
+```{r}
+# Read the data in R
+BMD_input_modules <- read_delim(file.path(input_dir, "BMD_Input_Modules.txt"))
+BMD_input_wiki <- read_delim(file.path(input_dir, "BMD_Input_Wiki.txt"), delim = "\t")
+BMD_input_kegg <- read_delim(file.path(input_dir, "BMD_Input_Kegg.txt"))
+BMD_input_gobp <- read_delim(file.path(input_dir, "BMD_Input_Gobp.txt"), delim = "\t")
+
+# Combine the data
+BMD_SD1 <- BMD_input_modules %>%
+  select("Analysis", "BMD Standard Deviation")
+BMD_SD2 <- BMD_input_wiki %>%
+  select("Analysis", "BMD Standard Deviation")
+BMD_SD3 <- BMD_input_kegg %>%
+  select("Analysis", "BMD Standard Deviation")
+BMD_SD4 <- BMD_input_gobp %>%
+  select("Analysis", "BMD Standard Deviation")
+
+BMD_SD1$Timepoint <- substring(BMD_SD1$Analysis, 11, 13)
+BMD_SD2$Timepoint <- substring(BMD_SD2$Analysis, 11, 13)
+BMD_SD3$Timepoint <- substring(BMD_SD3$Analysis, 11, 13)
+BMD_SD4$Timepoint <- substring(BMD_SD4$Analysis, 11, 13)
+
+BMD_SD1 <- BMD_SD1 %>%
+  select("Timepoint", "BMD Standard Deviation")
+BMD_SD2 <- BMD_SD2 %>%
+  select("Timepoint", "BMD Standard Deviation")
+BMD_SD3 <- BMD_SD3 %>%
+  select("Timepoint", "BMD Standard Deviation")
+BMD_SD4 <- BMD_SD4 %>%
+  select("Timepoint", "BMD Standard Deviation")
+
+BMD_SD1 <- BMD_SD1 %>%
+  mutate(Pathway_database = "Modules")
+BMD_SD2 <- BMD_SD2 %>%
+  mutate(Pathway_database = "Wiki")
+BMD_SD3 <- BMD_SD3 %>%
+  mutate(Pathway_database = "KEGG")
+BMD_SD4 <- BMD_SD4 %>%
+  mutate(Pathway_database = "GOBP")
+
+BMD_SD <- rbind(BMD_SD1, BMD_SD2, BMD_SD3, BMD_SD4)
+BMD_list <- list(BMD_SD1, BMD_SD2, BMD_SD3, BMD_SD4)
+```
+
+## Make the boxplot with pathway databases and standard deviation
+```{r}
+# Load necessary libraries
+library(tidyr)
+library(ggplot2)
+
+# Create the combined box plot
+BMD_SD <- BMD_SD %>%
+  rename(`BMD_Standard_Deviation` = `BMD Standard Deviation`)
+BMD_SD$Timepoint <- factor(BMD_SD$Timepoint, levels = c("8hr", "16h", "24h", "48h", "72h"))
+BMD_SD$Pathway_database <- factor(BMD_SD$Pathway_database, levels = c("Modules", "Wiki", "KEGG", "GOBP"))
+
+ggplot(BMD_SD, aes(x = Pathway_database, y = BMD_Standard_Deviation, fill = factor(Timepoint))) + geom_boxplot() + labs(x = "Category", y = "BMD Standard Deviation") + scale_fill_discrete(name = "Timepoint") + ggtitle("Boxplot of BMD Standard Deviation by Category and Timepoint")
+```
+## Comparison of overlapping modules
+
+# Modules
+
+```{r}
+#Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#Extract time point from Analysis column
+BMD_input_modules <- BMD_input_modules %>%
+  mutate(timepoint = str_extract(Analysis, "\\d+hr"))
+
+#Filter and select top 10 pathways by BMD Median for each timepoint
+top_pathways_M <- BMD_input_modules %>%
+  filter(!is.na(timepoint)) %>%
+  group_by(timepoint) %>%
+  arrange(`BMD Median`) %>%
+  slice(1:10) %>%
+  ungroup()
+
+#Give levels to timepoint
+top_pathways_M$timepoint <- factor(top_pathways_M$timepoint, levels = c("8hr", "16hr", "24hr", "48hr", "72hr"))
+
+#Filter between BMD SD < 10 and BMD SD > 10
+under_ten_top_pathways_M <- top_pathways_M %>%
+  filter(`BMD Standard Deviation` <= 10)
+above_ten_top_pathways_M <- top_pathways_M %>%
+  filter(`BMD Standard Deviation` > 10)
+
+#Plot BMD SD < 10
+ggplot(under_ten_top_pathways_M, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of Modules over time with BMD SD < 10", 
+       x = "BMD Median",
+       y = "Modules",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+#Plot BMD SD > 10
+ggplot(above_ten_top_pathways_M, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of Modules over time with BMD SD > 10", 
+       x = "BMD Median",
+       y = "Modules",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+```
+# Wiki pathways
+```{r}
+#Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#Extract time point from Analysis column
+BMD_input_wiki <- BMD_input_wiki %>%
+  mutate(timepoint = str_extract(Analysis, "\\d+hr"))
+
+#Filter and select top 10 pathways by BMD Median for each timepoint
+top_pathways_W <- BMD_input_wiki %>%
+  filter(!is.na(timepoint)) %>%
+  group_by(timepoint) %>%
+  arrange(`BMD Median`) %>%
+  slice(1:10) %>%
+  ungroup()
+
+#Give levels to timepoint
+top_pathways_W$timepoint <- factor(top_pathways_W$timepoint, levels = c("8hr", "16hr", "24hr", "48hr", "72hr"))
+
+#Filter between BMD SD < 10 and BMD SD > 10
+under_ten_top_pathways_W <- top_pathways_W %>%
+  filter(`BMD Standard Deviation` <= 10)
+above_ten_top_pathways_W <- top_pathways_W %>%
+  filter(`BMD Standard Deviation` > 10)
+
+#Plot BMD < 10
+ggplot(under_ten_top_pathways_W, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of Wiki pathways over time with BMD SD < 10", 
+       x = "BMD Median",
+       y = "Wiki pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+#Plot BMD > 10
+ggplot(above_ten_top_pathways_W, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of Wiki pathways over time with BMD SD > 10", 
+       x = "BMD Median",
+       y = "Wiki pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+```
+# KEGG
+```{r}
+#Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#Extract time point from Analysis column
+BMD_input_kegg <- BMD_input_kegg %>%
+  mutate(timepoint = str_extract(Analysis, "\\d+hr"))
+
+#Filter and select top 10 pathways by BMD Median for each timepoint
+top_pathways_K <- BMD_input_kegg %>%
+  filter(!is.na(timepoint)) %>%
+  group_by(timepoint) %>%
+  arrange(`BMD Median`) %>%
+  slice(1:10) %>%
+  ungroup()
+
+#Give levels to timepoint
+top_pathways_K$timepoint <- factor(top_pathways_K$timepoint, levels = c("8hr", "16hr", "24hr", "48hr", "72hr"))
+
+#Filter between BMD SD < 10 and BMD SD > 10
+under_ten_top_pathways_K <- top_pathways_K %>%
+  filter(`BMD Standard Deviation` <= 10)
+above_ten_top_pathways_K <- top_pathways_K %>%
+  filter(`BMD Standard Deviation` > 10)
+
+#Plot under 10 BMD SD
+ggplot(under_ten_top_pathways_K, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of KEGG pathways over time with BMD SD < 10", 
+       x = "BMD Median",
+       y = "KEGG pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+#Plot above 10 BMD SD
+ggplot(above_ten_top_pathways_K, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of KEGG pathways over time with BMD SD > 10", 
+       x = "BMD Median",
+       y = "KEGG pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+```
+# GOBP
+```{r}
+#Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#Extract time point from Analysis column
+BMD_input_gobp <- BMD_input_gobp %>%
+  mutate(timepoint = str_extract(Analysis, "\\d+hr"))
+
+#Filter and select top 10 pathways by BMD Median for each timepoint
+top_pathways_G <- BMD_input_gobp %>%
+  filter(!is.na(timepoint)) %>%
+  group_by(timepoint) %>%
+  arrange(`BMD Median`) %>%
+  slice(1:10) %>%
+  ungroup()
+
+#Give levels to timepoint and shorten one description
+top_pathways_G$timepoint <- factor(top_pathways_G$timepoint, levels = c("8hr", "16hr", "24hr", "48hr", "72hr"))
+top_pathways_G$`GO/Pathway/Gene Set/Gene Name` <- substring(top_pathways_G$`GO/Pathway/Gene Set/Gene Name`, 1, 80)
+
+#Filter between BMD SD < 10 and BMD_SD > 10
+under_ten_top_pathways_G <- top_pathways_G %>%
+  filter(`BMD Standard Deviation` <= 10)
+above_ten_top_pathways_G <- top_pathways_G %>%
+  filter(`BMD Standard Deviation` > 10)
+
+#Plot under 10 BMD SD
+ggplot(under_ten_top_pathways_G, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of GOBP pathways over time with BMD SD < 10", 
+       x = "BMD Median",
+       y = "GOBP pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+#Plot above 10 BMD SD
+ggplot(above_ten_top_pathways_G, aes(x = `BMD Median`, y = `GO/Pathway/Gene Set/Gene Name`, color = timepoint)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = `BMD Median`, xmax = `BMD Median` + `BMD Standard Deviation`), height = 0.5) +
+  labs(title = "BMD Median trends of GOBP pathways over time with BMD SD > 10", 
+       x = "BMD Median",
+       y = "GOBP pathways",
+       color = "Timepoint") +
+  scale_x_log10() +
+  theme_minimal()
+
+```
+# Fifth percentile
+```{r}
+BMD_4hr <- read_delim(file.path(input_dir, "BMD_4hr.txt"), delim = "\t")
+BMD_8hr <- read_delim(file.path(input_dir, "BMD_8hr.txt"), delim = "\t")
+BMD_16hr <- read_delim(file.path(input_dir, "BMD_16hr.txt"), delim = "\t")
+BMD_24hr <- read_delim(file.path(input_dir, "BMD_24hr.txt"), delim = "\t")
+BMD_48hr <- read_delim(file.path(input_dir, "BMD_48hr.txt"), delim = "\t")
+BMD_72hr <- read_delim(file.path(input_dir, "BMD_72hr.txt"), delim = "\t")
+
+fifthp_4hr <- quantile(BMD_4hr$`Best BMD`, probs = 0.05)
+fifthp_8hr <- quantile(BMD_8hr$`Best BMD`, probs = 0.05)
+fifthp_16hr <- quantile(BMD_16hr$`Best BMD`, probs = 0.05)
+fifthp_24hr <- quantile(BMD_24hr$`Best BMD`, probs = 0.05)
+fifthp_48hr <- quantile(BMD_48hr$`Best BMD`, probs = 0.05)
+fifthp_72hr <- quantile(BMD_72hr$`Best BMD`, probs = 0.05)
+
+print(fifthp_4hr)
+print(fifthp_8hr)
+print(fifthp_16hr)
+print(fifthp_24hr)
+print(fifthp_48hr)
+print(fifthp_72hr)
+```
